@@ -44,6 +44,7 @@ ConditionOperator = Literal[
     "ends_with",
 ]
 EffectType = Literal[
+    "recommendation_only",
     "allow",
     "block",
     "require_approval",
@@ -187,6 +188,10 @@ PAYLOAD_MODELS: dict[str, type[BaseModel]] = {
 }
 
 
+class _GenericPayload(BaseModel):
+    model_config = {"extra": "allow"}
+
+
 class StructuredEvent(BaseModel):
     event_id: str
     event_type: str
@@ -208,9 +213,7 @@ class StructuredEvent(BaseModel):
         return value
 
     def typed_payload(self) -> BaseModel:
-        model = PAYLOAD_MODELS.get(self.event_type)
-        if model is None:
-            return BaseModel.model_validate({})
+        model = PAYLOAD_MODELS.get(self.event_type, _GenericPayload)
         return model.model_validate(self.payload)
 
 
@@ -228,12 +231,17 @@ class Effect(BaseModel):
 class Rule(BaseModel):
     rule_id: str
     name: str
+    description: str = ""
     domain: str
     category: RuleCategory
     priority: int = 0
     version: int = 1
     status: RuleStatus = "active"
     enabled: bool = True
+    approval_required: bool = False
+    trigger: str = ""
+    explanation_template: str = ""
+    updated_at: str = "2026-11-24T00:00:00Z"
     event_types: list[str] = Field(default_factory=list)
     conditions: list[Condition] = Field(default_factory=list)
     effects: list[Effect] = Field(default_factory=list)
@@ -298,6 +306,8 @@ class EvaluationResult(BaseModel):
     routes: list[RouteDecision] = Field(default_factory=list)
     selected_workflow: WorkflowSelection | None = None
     redactions: list[Redaction] = Field(default_factory=list)
+    conflicts_resolved: list[dict[str, Any]] = Field(default_factory=list)
+    alternatives_considered: list[dict[str, Any]] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     dry_run: bool = False
     explanation: str = ""
@@ -313,7 +323,168 @@ class RuleEvaluationError(ValueError):
         self.warnings = warnings
 
 
-def evaluate_structured_event(event_data: dict[str, Any], *, dry_run: bool | None = None) -> EvaluationResult:
+_RUNTIME_RULE_OVERRIDES: dict[str, dict[str, Any]] = {}
+_RUNTIME_RULE_VERSIONS: dict[str, list[dict[str, Any]]] = {}
+
+
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def reset_rule_catalog_for_tests() -> None:
+    _RUNTIME_RULE_OVERRIDES.clear()
+    _RUNTIME_RULE_VERSIONS.clear()
+
+
+def get_effective_rules(rule_overrides: dict[str, dict[str, Any]] | None = None) -> list[Rule]:
+    base_rules = initial_rules()
+    merged_overrides = {**_RUNTIME_RULE_OVERRIDES, **(rule_overrides or {})}
+    effective: list[Rule] = []
+    for rule in base_rules:
+        data = rule.model_dump(mode="json")
+        if not data.get("trigger") and data.get("event_types"):
+            data["trigger"] = ", ".join(data["event_types"])
+        if not data.get("description"):
+            data["description"] = data["name"]
+        if not data.get("explanation_template"):
+            data["explanation_template"] = f"Rule {data['rule_id']} ({data['name']}) triggered on {data['trigger']}."
+        has_req_approval = any(e.get("effect_type") == "require_approval" for e in data.get("effects", []))
+        if has_req_approval and "approval_required" not in merged_overrides.get(rule.rule_id, {}):
+            data["approval_required"] = True
+        override = merged_overrides.get(rule.rule_id)
+        if override:
+            for key, val in override.items():
+                if key in data and val is not None:
+                    data[key] = val
+        effective.append(Rule.model_validate(data))
+    return effective
+
+
+def get_rules_catalog(rule_overrides: dict[str, dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    rules = get_effective_rules(rule_overrides)
+    catalog: list[dict[str, Any]] = []
+    for r in rules:
+        d = r.model_dump(mode="json")
+        d["actions"] = d.get("effects", [])
+        catalog.append(d)
+    return catalog
+
+
+def get_rule_version_history(rule_id: str) -> list[dict[str, Any]]:
+    base_map = {r.rule_id: r for r in get_effective_rules({})}
+    if rule_id not in base_map:
+        raise KeyError(f"Rule not found: {rule_id}")
+    history = _RUNTIME_RULE_VERSIONS.get(rule_id)
+    if not history:
+        base_dump = base_map[rule_id].model_dump(mode="json")
+        return [
+            {
+                "rule_id": rule_id,
+                "version": 1,
+                "updated_at": base_dump.get("updated_at", "2026-11-24T00:00:00Z"),
+                "updated_by": "system_seed",
+                "change_note": "Initial catalog version",
+                "snapshot": base_dump,
+            }
+        ]
+    return list(history)
+
+
+def update_rule_in_catalog(rule_id: str, patch: dict[str, Any], actor: str = "user") -> dict[str, Any]:
+    current_map = {r.rule_id: r for r in get_effective_rules()}
+    if rule_id not in current_map:
+        raise KeyError(f"Rule not found: {rule_id}")
+    current_rule = current_map[rule_id]
+    history = get_rule_version_history(rule_id)
+    next_version = max(item["version"] for item in history) + 1
+    now = _utc_iso()
+
+    updated_data = current_rule.model_dump(mode="json")
+    allowed_fields = {
+        "name",
+        "description",
+        "priority",
+        "enabled",
+        "status",
+        "approval_required",
+        "explanation_template",
+        "conditions",
+        "effects",
+        "event_types",
+        "stop_processing",
+    }
+    for k, v in patch.items():
+        if k in allowed_fields and v is not None:
+            updated_data[k] = v
+    updated_data["version"] = next_version
+    updated_data["updated_at"] = now
+
+    validated = Rule.model_validate(updated_data)
+    snapshot = validated.model_dump(mode="json")
+    _RUNTIME_RULE_OVERRIDES[rule_id] = snapshot
+    history.append(
+        {
+            "rule_id": rule_id,
+            "version": next_version,
+            "updated_at": now,
+            "updated_by": actor,
+            "change_note": str(patch.get("change_note") or "Rule updated via Control Center"),
+            "snapshot": snapshot,
+        }
+    )
+    _RUNTIME_RULE_VERSIONS[rule_id] = history
+    snapshot["actions"] = snapshot.get("effects", [])
+    return snapshot
+
+
+def rollback_rule_version(rule_id: str, target_version: int, actor: str = "user") -> dict[str, Any]:
+    history = get_rule_version_history(rule_id)
+    target_entry = next((item for item in history if int(item["version"]) == int(target_version)), None)
+    if not target_entry:
+        raise ValueError(f"Version {target_version} not found for rule {rule_id}")
+    restored_snapshot = dict(target_entry["snapshot"])
+    now = _utc_iso()
+    next_version = max(item["version"] for item in history) + 1
+    restored_snapshot["version"] = next_version
+    restored_snapshot["updated_at"] = now
+    validated = Rule.model_validate(restored_snapshot)
+    snapshot = validated.model_dump(mode="json")
+    _RUNTIME_RULE_OVERRIDES[rule_id] = snapshot
+    history.append(
+        {
+            "rule_id": rule_id,
+            "version": next_version,
+            "updated_at": now,
+            "updated_by": actor,
+            "change_note": f"Rollback to version {target_version}",
+            "restored_from_version": target_version,
+            "snapshot": snapshot,
+        }
+    )
+    _RUNTIME_RULE_VERSIONS[rule_id] = history
+    snapshot["actions"] = snapshot.get("effects", [])
+    return snapshot
+
+
+def _rule_primary_decision(rule: Rule) -> str:
+    best = "recommendation_only"
+    for eff in rule.effects:
+        if eff.effect_type == "block" and eff.parameters.get("action_type") and not eff.parameters.get("block_event", False):
+            continue
+        if eff.effect_type in DECISION_PRECEDENCE:
+            if DECISION_PRECEDENCE[eff.effect_type] > DECISION_PRECEDENCE[best]:
+                best = eff.effect_type
+    if rule.approval_required and DECISION_PRECEDENCE["require_approval"] > DECISION_PRECEDENCE[best]:
+        best = "require_approval"
+    return best
+
+
+def evaluate_structured_event(
+    event_data: dict[str, Any],
+    *,
+    dry_run: bool | None = None,
+    rule_overrides: dict[str, dict[str, Any]] | None = None,
+) -> EvaluationResult:
     try:
         event = StructuredEvent.model_validate(event_data)
         event.typed_payload()
@@ -321,7 +492,7 @@ def evaluate_structured_event(event_data: dict[str, Any], *, dry_run: bool | Non
         raise RuleEvaluationError([f"VALIDATION_ERROR:{err['loc']}:{err['msg']}" for err in exc.errors()]) from exc
 
     effective_dry_run = event.metadata.dry_run if dry_run is None else dry_run
-    rules = initial_rules()
+    rules = get_effective_rules(rule_overrides)
     matched = [rule for rule in rules if rule.executable() and _rule_matches_event(rule, event)]
     matched.sort(key=lambda rule: (-rule.priority, rule.rule_id))
 
@@ -333,7 +504,21 @@ def evaluate_structured_event(event_data: dict[str, Any], *, dry_run: bool | Non
         dry_run=effective_dry_run,
     )
 
+    alternatives_considered: list[dict[str, Any]] = []
+    conflicts_resolved: list[dict[str, Any]] = []
+
     for rule in matched:
+        rule_decision = _rule_primary_decision(rule)
+        alternatives_considered.append(
+            {
+                "rule_id": rule.rule_id,
+                "name": rule.name,
+                "version": rule.version,
+                "priority": rule.priority,
+                "candidate_decision": rule_decision,
+                "effects": [effect.effect_type for effect in rule.effects],
+            }
+        )
         state.matched_rules.append(
             MatchedRule(
                 rule_id=rule.rule_id,
@@ -344,10 +529,41 @@ def evaluate_structured_event(event_data: dict[str, Any], *, dry_run: bool | Non
                 effects=[effect.effect_type for effect in rule.effects],
             )
         )
+        if rule.approval_required:
+            _raise_decision(state, "require_approval")
         for effect in rule.effects:
             _apply_effect(state, effect)
         if rule.stop_processing:
             break
+
+    if len(alternatives_considered) > 1:
+        distinct_decisions = {item["candidate_decision"] for item in alternatives_considered}
+        winner = max(
+            alternatives_considered,
+            key=lambda item: (DECISION_PRECEDENCE.get(item["candidate_decision"], 0), item["priority"]),
+        )
+        for alt in alternatives_considered:
+            if alt["rule_id"] != winner["rule_id"] and (
+                len(distinct_decisions) > 1 or alt["priority"] != winner["priority"]
+            ):
+                conflicts_resolved.append(
+                    {
+                        "winning_rule_id": winner["rule_id"],
+                        "winning_version": winner["version"],
+                        "winning_priority": winner["priority"],
+                        "winning_decision": state.final_decision,
+                        "overridden_rule_id": alt["rule_id"],
+                        "overridden_version": alt["version"],
+                        "overridden_priority": alt["priority"],
+                        "overridden_decision": alt["candidate_decision"],
+                        "resolution_reason": (
+                            f"Resolved in favor of {winner['rule_id']} (priority={winner['priority']}, "
+                            f"decision={state.final_decision}) over {alt['rule_id']} "
+                            f"(priority={alt['priority']}, decision={alt['candidate_decision']}) "
+                            "by deterministic decision precedence and priority order."
+                        ),
+                    }
+                )
 
     state.reason_codes = _unique(state.reason_codes)
     explanation = (
@@ -368,6 +584,8 @@ def evaluate_structured_event(event_data: dict[str, Any], *, dry_run: bool | Non
         routes=_dedupe_models(state.routes),
         selected_workflow=state.selected_workflow,
         redactions=state.redactions,
+        conflicts_resolved=conflicts_resolved,
+        alternatives_considered=alternatives_considered,
         warnings=[],
         dry_run=effective_dry_run,
         explanation=explanation,
@@ -956,5 +1174,505 @@ def initial_rules() -> list[Rule]:
                 ),
                 Effect(effect_type="add_reason", parameters={"reason_code": "HIGH_INTENSITY_BLOCKED"}),
             ],
+        ),
+        # --- 20 Initial Proactive Personal Development Rules (Section 16) ---
+        Rule(
+            rule_id="FROG-001",
+            name="בדוק בערב אם קיימות לפחות ארבע צפרדעים",
+            description="בבדיקת ערב, כאשר מספר הצפרדעים הפעילות יורד מתחת ל-4, בקש מהמשתמש להשלים את המאגר מבלי להמציא צפרדעים.",
+            domain="frogs",
+            category="automation",
+            priority=100,
+            trigger="evening_review.frogs_check",
+            event_types=["evening_review.frogs_check"],
+            conditions=[Condition(field="payload.active_frogs_count", operator="less_than", value=4)],
+            effects=[
+                Effect(effect_type="recommendation_only"),
+                Effect(
+                    effect_type="propose_action",
+                    parameters={
+                        "action_type": "request_user_frog_pool_replenishment",
+                        "component": "compass",
+                        "title": "השלמת מאגר צפרדעים ל-4 צפרדעים פעילות",
+                        "purpose": "maintain_minimum_frog_pool_without_inventing",
+                    },
+                ),
+                Effect(effect_type="add_reason", parameters={"reason_code": "FROG_POOL_BELOW_MINIMUM_4"}),
+            ],
+            explanation_template="מאגר הצפרדעים מכיל פחות מ-4 צפרדעים פעילות; המערכת מבקשת השלמה מהמשתמש ואינה ממציאה צפרדעים.",
+        ),
+        Rule(
+            rule_id="FROG-002",
+            name="בחר צפרדע מתאימה לבוקר",
+            description="בחר צפרדע יומית מוקדם ביום לפי חשיבות, התנגדות, דחיפות, זמן זמין ואנרגיה.",
+            domain="frogs",
+            category="workflow_selection",
+            priority=95,
+            trigger="morning_plan.select_frog",
+            event_types=["morning_plan.select_frog", "daily_plan.evaluate"],
+            conditions=[Condition(field="payload.active_frogs_count", operator="greater_than_or_equal", value=1)],
+            effects=[
+                Effect(effect_type="allow"),
+                Effect(
+                    effect_type="propose_action",
+                    parameters={
+                        "action_type": "schedule_daily_frog_early",
+                        "component": "compass",
+                        "title": "שיבוץ צפרדע יומית מוקדם ביום",
+                        "purpose": "eat_that_frog_morning_priority",
+                    },
+                ),
+                Effect(effect_type="add_reason", parameters={"reason_code": "DAILY_FROG_SELECTED_FOR_MORNING"}),
+            ],
+            explanation_template="נבחרה צפרדע יומית לשיבוץ מוקדם בהתאם לחשיבות, התנגדות, זמן זמין ואנרגיה.",
+        ),
+        Rule(
+            rule_id="FROG-003",
+            name="הסר צפרדע חד-פעמית לאחר השלמה",
+            description="צפרדע חד-פעמית שהושלמה נסגרת אוטומטית מהמאגר הפעיל.",
+            domain="frogs",
+            category="automation",
+            priority=105,
+            trigger="frog.completed",
+            event_types=["frog.completed"],
+            conditions=[Condition(field="payload.frog_type", operator="equals", value="one_time")],
+            effects=[
+                Effect(effect_type="allow"),
+                Effect(
+                    effect_type="propose_action",
+                    parameters={
+                        "action_type": "close_completed_one_time_frog",
+                        "component": "compass",
+                        "title": "סגירת צפרדע חד-פעמית שהושלמה",
+                        "purpose": "close_one_time_frog",
+                    },
+                ),
+                Effect(effect_type="add_reason", parameters={"reason_code": "ONE_TIME_FROG_COMPLETED_AND_CLOSED"}),
+            ],
+            explanation_template="צפרדע חד-פעמית הושלמה ולכן נסגרה מהמאגר הפעיל.",
+        ),
+        Rule(
+            rule_id="FROG-004",
+            name="הסרת צפרדע מתמשכת דורשת אישור",
+            description="צפרדע מתמשכת נשארת במאגר גם לאחר ביצוע; הסרתה מהמאגר דורשת אישור משתמש מפורש.",
+            domain="frogs",
+            category="approval",
+            priority=120,
+            approval_required=True,
+            trigger="frog.remove_requested",
+            event_types=["frog.remove_requested"],
+            conditions=[Condition(field="payload.frog_type", operator="equals", value="ongoing")],
+            effects=[
+                Effect(effect_type="require_approval"),
+                Effect(
+                    effect_type="propose_action",
+                    parameters={
+                        "action_type": "remove_ongoing_frog",
+                        "component": "compass",
+                        "title": "אישור הסרת צפרדע מתמשכת ממאגר הצפרדעים",
+                        "purpose": "confirm_ongoing_frog_no_longer_triggers_resistance",
+                        "requires_approval": True,
+                    },
+                ),
+                Effect(effect_type="add_reason", parameters={"reason_code": "ONGOING_FROG_REMOVAL_REQUIRES_APPROVAL"}),
+            ],
+            explanation_template="הסרת צפרדע מתמשכת מחייבת אישור מפורש של המשתמש כי אינה מעוררת עוד התנגדות.",
+        ),
+        Rule(
+            rule_id="HABIT-001",
+            name="הצע גרסה מינימלית כאשר קיימת התנגדות",
+            description="כאשר מדווחת התנגדות גבוהה או אנרגיה נמוכה, הצע גרסה מינימלית של ההרגל לשמירה על רצף ללא ענישה.",
+            domain="habits",
+            category="recommendation",
+            priority=95,
+            trigger="routine.resistance_detected",
+            event_types=["routine.resistance_detected", "daily_plan.evaluate"],
+            conditions=[Condition(field="payload.resistance_level", operator="greater_than_or_equal", value=7)],
+            effects=[
+                Effect(effect_type="allow"),
+                Effect(
+                    effect_type="propose_action",
+                    parameters={
+                        "action_type": "activate_minimum_viable_routine",
+                        "component": "self_manage",
+                        "title": "הפעלת גרסה מינימלית של השגרה",
+                        "purpose": "reduce_activation_resistance",
+                    },
+                ),
+                Effect(effect_type="add_reason", parameters={"reason_code": "HIGH_RESISTANCE_MINIMUM_VIABLE_HABIT"}),
+            ],
+            explanation_template="זוהתה התנגדות גבוהה; המערכת מציעה גרסה מינימלית של השגרה כדי להקל על התחלת הפעולה.",
+        ),
+        Rule(
+            rule_id="MENTAL-001",
+            name="הצע הכנה קצרה לפני אירוע מאתגר",
+            description="לפני פעולה או אירוע המעוררים מתח מקדים, הפעל פרוטוקול הכנה קצר בן 6 שלבים.",
+            domain="mental",
+            category="recommendation",
+            priority=95,
+            trigger="event.challenging_upcoming",
+            event_types=["event.challenging_upcoming", "frog.starting"],
+            conditions=[Condition(field="payload.expected_resistance", operator="greater_than_or_equal", value=6)],
+            effects=[
+                Effect(effect_type="allow"),
+                Effect(
+                    effect_type="propose_action",
+                    parameters={
+                        "action_type": "run_pre_action_preparation_protocol",
+                        "component": "compass",
+                        "title": "פרוטוקול הכנה קצר (30–60 שניות) לפני פעולה מאתגרת",
+                        "purpose": "pre_event_mental_preparation",
+                    },
+                ),
+                Effect(effect_type="add_reason", parameters={"reason_code": "PRE_EVENT_PREPARATION_RECOMMENDED"}),
+            ],
+            explanation_template="לפני אירוע או צפרדע עם התנגדות גבוהה מופעל פרוטוקול הכנה קצר להפחתת מתח מקדים.",
+        ),
+        Rule(
+            rule_id="MENTAL-002",
+            name="אפשר תיעוד מהיר לאחר אירוע",
+            description="לאחר אירוע רגשי או מנטלי, אפשר תיעוד מהיר (כולל דיווח חלקי שבו שדה חסר אינו נחשב כאפס).",
+            domain="mental",
+            category="workflow_selection",
+            priority=90,
+            trigger="mental_event.occurred",
+            event_types=["mental_event.occurred"],
+            conditions=[],
+            effects=[
+                Effect(effect_type="allow"),
+                Effect(
+                    effect_type="propose_action",
+                    parameters={
+                        "action_type": "capture_quick_post_event_reflection",
+                        "component": "compass",
+                        "title": "תיעוד מהיר של אירוע מנטלי (דיווח מלא או חלקי)",
+                        "purpose": "post_event_processing",
+                    },
+                ),
+                Effect(effect_type="add_reason", parameters={"reason_code": "POST_EVENT_QUICK_CAPTURE_ENABLED"}),
+            ],
+            explanation_template="אירוע מנטלי הסתיים; מופעל תיעוד מהיר התומך בדיווח חלקי ובשמירת פרטיות.",
+        ),
+        Rule(
+            rule_id="MENTAL-003",
+            name="בדוק הצלחות שקטות אחת לשבוע",
+            description="אחת לשבוע בדוק ותעד מצבים שבעבר עוררו תגובה חריגה והפעם עברו בשקט.",
+            domain="mental",
+            category="automation",
+            priority=90,
+            trigger="weekly_review.silent_wins_check",
+            event_types=["weekly_review.silent_wins_check"],
+            conditions=[Condition(field="payload.days_since_silent_wins_check", operator="greater_than_or_equal", value=7)],
+            effects=[
+                Effect(effect_type="recommendation_only"),
+                Effect(
+                    effect_type="propose_action",
+                    parameters={
+                        "action_type": "prompt_weekly_silent_wins_check",
+                        "component": "compass",
+                        "title": "בדיקת הצלחות שקטות שבועית",
+                        "purpose": "prevent_negative_reporting_bias",
+                    },
+                ),
+                Effect(effect_type="add_reason", parameters={"reason_code": "WEEKLY_SILENT_WINS_CHECK_DUE"}),
+            ],
+            explanation_template="חלף שבוע מאז בדיקת ההצלחות השקטות האחרונה; מופעלת בדיקה למניעת הטיית מדידה שלילית.",
+        ),
+        Rule(
+            rule_id="ASSESS-001",
+            name="הפק הערכה חודשית",
+            description="אחת לחודש הפק הערכת מגמות מנטלית והתנהגותית ב-Personal Assessment.",
+            domain="assessment",
+            category="routing",
+            priority=85,
+            trigger="monthly_review.due",
+            event_types=["monthly_review.due"],
+            conditions=[Condition(field="payload.days_since_last_monthly_review", operator="greater_than_or_equal", value=28)],
+            effects=[
+                Effect(effect_type="allow_read_only"),
+                Effect(
+                    effect_type="route_to",
+                    parameters={
+                        "component": "personal_Assessment",
+                        "capability": "monthly_mental_review",
+                        "purpose": "generate_monthly_trend_assessment",
+                    },
+                ),
+                Effect(effect_type="add_reason", parameters={"reason_code": "MONTHLY_ASSESSMENT_DUE"}),
+            ],
+            explanation_template="הגיע מועד ההערכה החודשית; הבקשה מנותבת אל Personal Assessment.",
+        ),
+        Rule(
+            rule_id="ASSESS-002",
+            name="אל תסיק מגמה כשאין מספיק נתונים",
+            description="חסום הסקת מגמת שיפור או נסיגה כאשר מספר האירועים המתועדים נמוך מסף המינימום (5 אירועים).",
+            domain="assessment",
+            category="hard_policy",
+            priority=130,
+            trigger="assessment.trend_requested",
+            event_types=["assessment.trend_requested"],
+            conditions=[Condition(field="payload.event_count", operator="less_than", value=5)],
+            effects=[
+                Effect(
+                    effect_type="block",
+                    parameters={
+                        "action_type": "infer_mental_trend",
+                        "reason_code": "INSUFFICIENT_MENTAL_EVENT_DATA",
+                        "block_event": True,
+                    },
+                ),
+                Effect(effect_type="add_reason", parameters={"reason_code": "INSUFFICIENT_MENTAL_EVENT_DATA"}),
+            ],
+            stop_processing=True,
+            explanation_template="כמות הנתונים נמוכה מסף המינימום (5 אירועים); נחסמה הסקת מגמה בלתי מבוססת.",
+        ),
+        Rule(
+            rule_id="GROWTH-001",
+            name="תעדף תחומי ליבה",
+            description="תעדף את תחומי הליבה (מנטלי, פיזי, AI מקצועי) על פני תחומי העשרה בתוכנית היומית.",
+            domain="growth",
+            category="workflow_selection",
+            priority=100,
+            trigger="daily_plan.evaluate",
+            event_types=["daily_plan.evaluate"],
+            conditions=[Condition(field="payload.core_domains_scheduled_count", operator="equals", value=0)],
+            effects=[
+                Effect(effect_type="allow"),
+                Effect(
+                    effect_type="propose_action",
+                    parameters={
+                        "action_type": "prioritize_core_growth_domain",
+                        "component": "compass",
+                        "title": "הוספת פעילות ליבה (מנטלי / פיזי / AI) לתוכנית היומית",
+                        "purpose": "ensure_core_domain_priority",
+                    },
+                ),
+                Effect(effect_type="add_reason", parameters={"reason_code": "CORE_GROWTH_DOMAIN_PRIORITIZED"}),
+            ],
+            explanation_template="תחומי הליבה (מנטלי, פיזי, AI) מתועדפים לפני תחומי העשרה בתוכנית היומית.",
+        ),
+        Rule(
+            rule_id="GROWTH-002",
+            name="זהה תחום שלא התקדם",
+            description="זהה תחום ליבה שלא נרשמה בו פעילות מעבר לסף הימים המוגדר והצע התערבות מתאימה.",
+            domain="growth",
+            category="recommendation",
+            priority=95,
+            trigger="growth_domain.check",
+            event_types=["growth_domain.check"],
+            conditions=[
+                Condition(field="payload.tier", operator="equals", value="core"),
+                Condition(field="payload.days_since_last_activity", operator="greater_than_or_equal", value=7),
+            ],
+            effects=[
+                Effect(effect_type="recommendation_only"),
+                Effect(
+                    effect_type="propose_action",
+                    parameters={
+                        "action_type": "propose_neglected_core_domain_intervention",
+                        "component": "compass",
+                        "title": "הצעת התערבות לתחום ליבה שלא התקדם",
+                        "purpose": "prevent_core_domain_neglect",
+                    },
+                ),
+                Effect(effect_type="add_reason", parameters={"reason_code": "NEGLECTED_CORE_DOMAIN_DETECTED"}),
+            ],
+            explanation_template="תחום ליבה לא התקדם במשך 7 ימים או יותר; נוצרה הצעת התערבות.",
+        ),
+        Rule(
+            rule_id="CHALLENGE-001",
+            name="התאם אתגר לפי ביצועים ומגבלות",
+            description="בחן התקדמות, דריכה במקום או עומס והצע התאמת רמת קושי של האתגר.",
+            domain="challenges",
+            category="recommendation",
+            priority=90,
+            trigger="challenge.evaluate",
+            event_types=["challenge.evaluate"],
+            conditions=[Condition(field="payload.pain_or_limitation", operator="equals", value=False)],
+            effects=[
+                Effect(effect_type="allow"),
+                Effect(
+                    effect_type="propose_action",
+                    parameters={
+                        "action_type": "adjust_challenge_within_approved_bounds",
+                        "component": "compass",
+                        "title": "התאמת רמת קושי אתגר בגבולות המאושרים",
+                        "purpose": "adaptive_challenge_progression",
+                    },
+                ),
+                Effect(effect_type="add_reason", parameters={"reason_code": "ADAPTIVE_CHALLENGE_EVALUATED"}),
+            ],
+            explanation_template="האתגר נבחן מול ביצועי המשתמש ומגבלותיו להצעת התאמת רמת קושי.",
+        ),
+        Rule(
+            rule_id="CHALLENGE-002",
+            name="אל תעלה קושי מעבר לגבולות המאושרים",
+            description="חסום העלאת עומס או קושי כאשר קיימת מגבלת בטיחות/כאב או חריגה מתקרת הקושי שהמשתמש אישר.",
+            domain="challenges",
+            category="hard_policy",
+            priority=135,
+            trigger="challenge.evaluate",
+            event_types=["challenge.evaluate"],
+            conditions=[Condition(field="payload.exceeds_safety_or_approved_bounds", operator="equals", value=True)],
+            effects=[
+                Effect(
+                    effect_type="block",
+                    parameters={
+                        "action_type": "increase_challenge_difficulty",
+                        "reason_code": "CHALLENGE_BOUNDS_OR_SAFETY_LIMIT_EXCEEDED",
+                        "block_event": True,
+                    },
+                ),
+                Effect(effect_type="set_risk", parameters={"risk_level": "high"}),
+                Effect(effect_type="add_reason", parameters={"reason_code": "CHALLENGE_BOUNDS_OR_SAFETY_LIMIT_EXCEEDED"}),
+            ],
+            stop_processing=True,
+            explanation_template="נחסמה העלאת רמת קושי עקב דיווח על כאב/מגבלת בטיחות או חריגה מהגבול המאושר.",
+        ),
+        Rule(
+            rule_id="PLAN-001",
+            name="התאם תוכנית לזמן ולאנרגיה",
+            description="כאשר רמת האנרגיה נמוכה (1–2), התאם את התוכנית היומית לגרסה קלה ומדורגת.",
+            domain="planning",
+            category="workflow_selection",
+            priority=105,
+            trigger="daily_plan.evaluate",
+            event_types=["daily_plan.evaluate"],
+            conditions=[Condition(field="payload.energy_level", operator="less_than_or_equal", value=2)],
+            effects=[
+                Effect(effect_type="allow"),
+                Effect(
+                    effect_type="propose_action",
+                    parameters={
+                        "action_type": "scale_down_plan_for_low_energy",
+                        "component": "compass",
+                        "title": "התאמת תוכנית יומית לאנרגיה נמוכה (גרסאות מינימליות)",
+                        "purpose": "energy_aware_daily_planning",
+                    },
+                ),
+                Effect(effect_type="add_reason", parameters={"reason_code": "LOW_ENERGY_PLAN_ADAPTED"}),
+            ],
+            explanation_template="רמת האנרגיה נמוכה; התוכנית היומית הותאמה לעומס מופחת וגרסאות מינימליות.",
+        ),
+        Rule(
+            rule_id="PLAN-002",
+            name="מנע עומס מופרז",
+            description="כאשר סך הדקות המתוכננות עולה על הזמן הזמין של המשתמש, דרוש אישור או צמצום לפני הפעלת התוכנית.",
+            domain="planning",
+            category="approval",
+            priority=125,
+            approval_required=True,
+            trigger="daily_plan.evaluate",
+            event_types=["daily_plan.evaluate"],
+            conditions=[Condition(field="payload.is_overloaded", operator="equals", value=True)],
+            effects=[
+                Effect(effect_type="require_approval"),
+                Effect(effect_type="set_risk", parameters={"risk_level": "medium"}),
+                Effect(
+                    effect_type="propose_action",
+                    parameters={
+                        "action_type": "trim_or_approve_overloaded_daily_plan",
+                        "component": "compass",
+                        "title": "תוכנית יומית חורגת מהזמן הזמין – נדרש צמצום או אישור",
+                        "purpose": "prevent_impossible_daily_plan",
+                        "requires_approval": True,
+                    },
+                ),
+                Effect(effect_type="add_reason", parameters={"reason_code": "DAILY_PLAN_EXCEEDS_AVAILABLE_TIME"}),
+            ],
+            explanation_template="זמן הפעילויות המתוכנן עולה על הזמן הזמין; התוכנית נשמרה כממתינה לאישור כדי למנוע עומס בלתי אפשרי.",
+        ),
+        Rule(
+            rule_id="AI-001",
+            name="העדף פתרון דטרמיניסטי",
+            description="חסום קריאה למודל שפה (LLM) כאשר קיים פתרון דטרמיניסטי באמצעות כללים או חישוב.",
+            domain="ai_governance",
+            category="hard_policy",
+            priority=130,
+            trigger="ai.invocation_requested",
+            event_types=["ai.invocation_requested"],
+            conditions=[Condition(field="payload.deterministic_available", operator="equals", value=True)],
+            effects=[
+                Effect(
+                    effect_type="block",
+                    parameters={
+                        "action_type": "invoke_llm",
+                        "reason_code": "DETERMINISTIC_SOLUTION_AVAILABLE",
+                        "block_event": True,
+                    },
+                ),
+                Effect(effect_type="add_reason", parameters={"reason_code": "DETERMINISTIC_SOLUTION_AVAILABLE"}),
+            ],
+            stop_processing=True,
+            explanation_template="קיים פתרון דטרמיניסטי לפעולה זו; הקריאה למודל השפה נחסמה לחיסכון בעלויות ושמירה על עקביות.",
+        ),
+        Rule(
+            rule_id="AI-002",
+            name="תעד כל קריאה למודל",
+            description="כל הפעלה של מודל שפה או תמלול/הקראה חייבת להירשם ביומן השימוש עם סיבה, סוג ועלות.",
+            domain="ai_governance",
+            category="automation",
+            priority=100,
+            trigger="ai.invocation_requested",
+            event_types=["ai.invocation_requested"],
+            conditions=[Condition(field="payload.deterministic_available", operator="equals", value=False)],
+            effects=[
+                Effect(effect_type="allow"),
+                Effect(
+                    effect_type="propose_action",
+                    parameters={
+                        "action_type": "log_ai_model_invocation",
+                        "component": "compass",
+                        "title": "תיעוד קריאה למודל AI ביומן העלויות",
+                        "purpose": "track_ai_usage_and_cost",
+                    },
+                ),
+                Effect(effect_type="add_reason", parameters={"reason_code": "AI_INVOCATION_LOGGED"}),
+            ],
+            explanation_template="אין פתרון דטרמיניסטי מספק; הקריאה למודל מאושרת ומתועדת ביומן השימוש והעלויות.",
+        ),
+        Rule(
+            rule_id="CONTROL-001",
+            name="שינוי מדיניות דורש אישור",
+            description="כל שינוי מהותי במדיניות, מטרות ליבה או גבולות אוטונומיה דורש אישור מפורש של המשתמש בתפקיד המתכנן.",
+            domain="control",
+            category="approval",
+            priority=140,
+            approval_required=True,
+            trigger="policy.change_requested",
+            event_types=["policy.change_requested"],
+            conditions=[Condition(field="payload.is_material_change", operator="equals", value=True)],
+            effects=[
+                Effect(effect_type="require_approval"),
+                Effect(effect_type="set_risk", parameters={"risk_level": "high"}),
+                Effect(
+                    effect_type="propose_action",
+                    parameters={
+                        "action_type": "approve_policy_change",
+                        "component": "compass",
+                        "title": "אישור שינוי מדיניות או גבולות אוטונומיה",
+                        "purpose": "protect_user_policy_sovereignty",
+                        "requires_approval": True,
+                    },
+                ),
+                Effect(effect_type="add_reason", parameters={"reason_code": "MATERIAL_POLICY_CHANGE_REQUIRES_APPROVAL"}),
+            ],
+            explanation_template="שינוי מהותי במדיניות או בגבולות האוטונומיה מחייב אישור מפורש של המשתמש.",
+        ),
+        Rule(
+            rule_id="CONTROL-002",
+            name="כל החלטה משמעותית ניתנת להסבר",
+            description="כל החלטה משמעותית מתועדת עם הכלל שהופעל, גרסתו, הנתונים בפועל והחלופות שנבדקו.",
+            domain="control",
+            category="automation",
+            priority=90,
+            trigger="decision.recorded",
+            event_types=["decision.recorded", "daily_plan.evaluate"],
+            conditions=[],
+            effects=[
+                Effect(effect_type="allow"),
+                Effect(effect_type="add_reason", parameters={"reason_code": "DECISION_AUDIT_AND_EXPLANATION_RECORDED"}),
+            ],
+            explanation_template="ההחלטה תועדה ביומן ההחלטות עם הכלל, גרסתו, הנתונים שהוזנו והחלופות שנבדקו.",
         ),
     ]

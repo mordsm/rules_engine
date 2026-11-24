@@ -1,14 +1,14 @@
-﻿ruleset_name: "Family_And_David_Mental_Health_Monitor"
+ruleset_name: "Family_And_David_Mental_Health_Monitor"
 version: "1.0"
 description: "Shared family decision manager configuration with deterministic rules and optional Ollama support"
 
 llm:
   provider: ollama
-  enabled: true
+  enabled: false
   model: llama3.2
   base_url: http://localhost:11434
   timeout_seconds: 30
-  fallback_to_llm: true
+  fallback_to_llm: false
 
 # Enable manual review for decisions that should be approved before execution.
 review_required: false

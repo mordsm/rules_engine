@@ -6,7 +6,14 @@ from typing import Any, Callable, Dict, Optional
 from wsgiref.simple_server import make_server
 
 from api import evaluate_family_decision
-from compass_rules import RuleEvaluationError, evaluate_structured_event
+from compass_rules import (
+    RuleEvaluationError,
+    evaluate_structured_event,
+    get_rule_version_history,
+    get_rules_catalog,
+    rollback_rule_version,
+    update_rule_in_catalog,
+)
 from rule_engine_agent import FamilyDecisionManager
 
 
@@ -32,6 +39,7 @@ def app(config_path: Optional[str | Path] = None) -> Callable[[Dict[str, Any], A
                     result_model = evaluate_structured_event(
                         event,
                         dry_run=bool(payload.get("dry_run", event.get("metadata", {}).get("dry_run", False))),
+                        rule_overrides=payload.get("rule_overrides"),
                     )
                 except RuleEvaluationError as exc:
                     start_response("422 Unprocessable Entity", [("Content-Type", "application/json")])
