@@ -339,8 +339,10 @@ def reset_rule_catalog_for_tests() -> None:
 def get_effective_rules(rule_overrides: dict[str, dict[str, Any]] | None = None) -> list[Rule]:
     base_rules = initial_rules()
     merged_overrides = {**_RUNTIME_RULE_OVERRIDES, **(rule_overrides or {})}
+    seen_ids: set[str] = set()
     effective: list[Rule] = []
     for rule in base_rules:
+        seen_ids.add(rule.rule_id)
         data = rule.model_dump(mode="json")
         if not data.get("trigger") and data.get("event_types"):
             data["trigger"] = ", ".join(data["event_types"])
@@ -357,6 +359,14 @@ def get_effective_rules(rule_overrides: dict[str, dict[str, Any]] | None = None)
                 if key in data and val is not None:
                     data[key] = val
         effective.append(Rule.model_validate(data))
+
+    # Also include user-created custom rules stored in rule_overrides
+    for custom_id, custom_data in merged_overrides.items():
+        if custom_id not in seen_ids and isinstance(custom_data, dict) and custom_data.get("rule_id"):
+            try:
+                effective.append(Rule.model_validate(custom_data))
+            except ValidationError:
+                pass
     return effective
 
 
