@@ -1,0 +1,83 @@
+﻿ruleset_name: "Family_And_David_Mental_Health_Monitor"
+version: "1.0"
+description: "Shared family decision manager configuration with deterministic rules and optional Ollama support"
+
+llm:
+  provider: ollama
+  enabled: true
+  model: llama3.2
+  base_url: http://localhost:11434
+  timeout_seconds: 30
+  fallback_to_llm: true
+
+# Enable manual review for decisions that should be approved before execution.
+review_required: false
+
+rules:
+  - id: screen_time_limit
+    description: "Reduce screen time when the family is tired"
+    condition:
+      category: schedule
+      value: tired
+    action: reduce
+    priority: 2
+
+  - rule_id: "R001_David_Psychotic_Keywords_Check"
+    description: "Detect high-risk mental-health keywords in David's text"
+    trigger_event: "TEXT_INGESTION"
+    conditions:
+      operator: "AND"
+      criteria:
+        - field: "entity_id"
+          operator: "EQUALS"
+          value: "DAVID"
+        - field: "cleaned_text"
+          operator: "CONTAINS_ANY"
+          value:
+            - "אלוהים"
+            - "יהוה"
+            - "כוחות על"
+            - "משקיף"
+            - "רוחניות"
+            - "קאנאביס"
+            - "גראס"
+    actions:
+      - action_type: "IMMEDIATE_ALERT"
+        channels:
+          - "TELEGRAM"
+          - "EMAIL"
+        payload:
+          title: "🚨 התראה מיידית: זוהה תוכן בעל סיכון מנטלי גבוה (דוד)"
+          priority: "CRITICAL"
+      - action_type: "ROUTE_TO_LOCAL_LLM"
+        execution_mode: "FORCE_CONTEXT_ANALYSIS"
+
+  - rule_id: "R002_David_Financial_Anomaly_Check"
+    description: "Monitor immediate financial anomalies for David"
+    trigger_event: "FINANCIAL_TRANSACTION"
+    conditions:
+      operator: "AND"
+      criteria:
+        - field: "entity_id"
+          operator: "EQUALS"
+          value: "DAVID"
+        - field: "payment_method"
+          operator: "IN"
+          value:
+            - "ISRACARD"
+            - "BIT"
+            - "BANK_ACCOUNT"
+        - field: "amount"
+          operator: "GREATER_THAN"
+          value: 200
+    actions:
+      - action_type: "IMMEDIATE_ALERT"
+        channels:
+          - "TELEGRAM"
+          - "EMAIL"
+        payload:
+          title: "💰 התראה מיידית: זוהתה הוצאה כספית חריגה מעל 200 ש''ח (דוד)"
+          priority: "CRITICAL"
+      - action_type: "UPDATE_DATABASE"
+        target_table: "Behavioral_Logs"
+        category: "הוצאה חריגה"

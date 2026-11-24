@@ -1,0 +1,20 @@
+[project]
+name = "rules-engine"
+version = "0.1.0"
+description = "Reusable rule engine agent for family and other decision workflows"
+requires-python = ">=3.10"
+dependencies = ["pydantic>=2.8", "PyYAML>=6.0"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = [
+  "api",
+  "cli",
+  "compass_rules",
+  "example_service_call",
+  "rule_engine_agent",
+  "service",
+]
